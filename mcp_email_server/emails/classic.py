@@ -827,19 +827,19 @@ class EmailClient:
         self,
         email_id: str,
         attachment_name: str,
-        save_path: str,
+        save_path: str | None,
         mailbox: str = "INBOX",
     ) -> dict[str, Any]:
-        """Download a specific attachment from an email and save it to disk.
+        """Download a specific attachment from an email.
 
         Args:
             email_id: The UID of the email containing the attachment.
             attachment_name: The filename of the attachment to download.
-            save_path: The local path where the attachment will be saved.
+            save_path: Optional local path to save the attachment to disk.
             mailbox: The mailbox to search in (default: "INBOX").
 
         Returns:
-            A dictionary with download result information.
+            A dictionary with download result information including raw bytes.
         """
         imap = await self._connect_imap()
         try:
@@ -887,19 +887,21 @@ class EmailClient:
                 logger.error(msg)
                 raise ValueError(msg)
 
-            # Save to disk
-            save_file = Path(save_path)
-            save_file.parent.mkdir(parents=True, exist_ok=True)
-            save_file.write_bytes(attachment_data)
-
-            logger.info(f"Attachment '{attachment_name}' saved to {save_path}")
+            resolved_path: str | None = None
+            if save_path is not None:
+                save_file = Path(save_path)
+                save_file.parent.mkdir(parents=True, exist_ok=True)
+                save_file.write_bytes(attachment_data)
+                resolved_path = str(save_file.resolve())
+                logger.info(f"Attachment '{attachment_name}' saved to {save_path}")
 
             return {
                 "email_id": email_id,
                 "attachment_name": attachment_name,
                 "mime_type": mime_type or "application/octet-stream",
                 "size": len(attachment_data),
-                "saved_path": str(save_file.resolve()),
+                "saved_path": resolved_path,
+                "data": attachment_data,
             }
 
         finally:
@@ -1588,15 +1590,15 @@ class ClassicEmailHandler(EmailHandler):
         self,
         email_id: str,
         attachment_name: str,
-        save_path: str,
+        save_path: str | None,
         mailbox: str = "INBOX",
     ) -> AttachmentDownloadResponse:
-        """Download an email attachment and save it to the specified path.
+        """Download an email attachment, optionally saving it to disk.
 
         Args:
             email_id: The UID of the email containing the attachment.
             attachment_name: The filename of the attachment to download.
-            save_path: The local path where the attachment will be saved.
+            save_path: Optional local path to save the attachment.
             mailbox: The mailbox to search in (default: "INBOX").
 
         Returns:
@@ -1609,4 +1611,5 @@ class ClassicEmailHandler(EmailHandler):
             mime_type=result["mime_type"],
             size=result["size"],
             saved_path=result["saved_path"],
+            data=result["data"],
         )
