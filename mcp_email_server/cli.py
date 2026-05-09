@@ -1,15 +1,25 @@
+from __future__ import annotations
+
+import contextlib
 import os
+from typing import AsyncIterator
 
 import typer
+import uvicorn
 from mcp.server.transport_security import TransportSecuritySettings
+from starlette.applications import Starlette
+from starlette.middleware import Middleware
+from starlette.middleware.trustedhost import TrustedHostMiddleware
+from starlette.routing import Mount
 
 from mcp_email_server.app import mcp
+from mcp_email_server.attachments.routes import attachment_route
+from mcp_email_server.attachments.store import attachment_store
 from mcp_email_server.config import delete_settings
 
 app = typer.Typer()
 
-LOOPBACK_ALLOWED_HOSTS = ["127.0.0.1:*", "localhost:*", "[::1]:*"]
-LOOPBACK_ALLOWED_ORIGINS = ["http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*"]
+LOOPBACK_HOSTS = ["127.0.0.1", "localhost", "[::1]"]
 WILDCARD_IPV4_BIND_HOST = "0.0.0.0"  # noqa: S104
 WILDCARD_BIND_HOSTS = {WILDCARD_IPV4_BIND_HOST, "::", ""}
 FALSE_VALUES = {"0", "false", "no", "off"}
@@ -34,83 +44,107 @@ def _normalize_host(host: str) -> str:
     return host
 
 
-def _unique(values: list[str]) -> list[str]:
-    return list(dict.fromkeys(values))
+def _build_trusted_host_middleware(bind_host: str, port: int) -> Middleware | None:
+    """Return TrustedHostMiddleware configured for the given bind address, or None if disabled.
+
+    Trusted host behaviour:
+    - Disabled entirely if MCP_ENABLE_DNS_REBINDING_PROTECTION=false or MCP_ALLOWED_HOSTS=*
+    - Wildcard bind (0.0.0.0 / :: / "") → no middleware; operator must use MCP_ALLOWED_HOSTS
+      to restrict if desired, since the server is intentionally public-facing.
+    - Loopback bind → allow only loopback hostnames.
+    - Specific host → allow loopback + that hostname.
+    - Explicit MCP_ALLOWED_HOSTS → use those (port suffixes stripped).
+    """
+    if not _is_dns_rebinding_protection_enabled():
+        return None
+
+    explicit = _split_csv(os.environ.get("MCP_ALLOWED_HOSTS"))
+    if "*" in explicit:
+        return None
+
+    if explicit:
+        # TrustedHostMiddleware matches on hostname only — strip port suffixes.
+        allowed = list({h.split(":")[0] for h in explicit})
+        return Middleware(TrustedHostMiddleware, allowed_hosts=allowed)
+
+    normalized = _normalize_host(bind_host)
+    if bind_host in WILDCARD_BIND_HOSTS:
+        # Wildcard bind is intentionally public; skip host restriction by default.
+        return None
+    if normalized in set(LOOPBACK_HOSTS):
+        return Middleware(TrustedHostMiddleware, allowed_hosts=LOOPBACK_HOSTS)
+    return Middleware(TrustedHostMiddleware, allowed_hosts=LOOPBACK_HOSTS + [normalized])
 
 
-def _expand_allowed_hosts(allowed_hosts: list[str]) -> list[str]:
-    expanded: list[str] = []
-    for allowed_host in allowed_hosts:
-        expanded.append(allowed_host)
-        if (":" not in allowed_host and allowed_host != "*") or (
-            allowed_host.startswith("[") and allowed_host.endswith("]")
-        ):
-            expanded.append(f"{allowed_host}:*")
-    return _unique(expanded)
+def _build_fastmcp_transport_security(bind_host: str, port: int) -> TransportSecuritySettings:
+    """Build TransportSecuritySettings to inject into FastMCP's own security layer.
 
-
-def _expand_allowed_origins(allowed_origins: list[str]) -> list[str]:
-    expanded: list[str] = []
-    for allowed_origin in allowed_origins:
-        expanded.append(allowed_origin)
-        scheme_separator = "://"
-        if scheme_separator in allowed_origin and allowed_origin != "*":
-            scheme, host = allowed_origin.split(scheme_separator, maxsplit=1)
-            has_port = host.rsplit(":", maxsplit=1)[-1].isdigit() or host.endswith(":*")
-            if (":" not in host or (host.startswith("[") and host.endswith("]"))) and not has_port:
-                expanded.append(f"{scheme}{scheme_separator}{host}:*")
-    return _unique(expanded)
-
-
-def _default_allowed_hosts(host: str, port: int) -> list[str]:
-    allowed_hosts = list(LOOPBACK_ALLOWED_HOSTS)
-    normalized_host = _normalize_host(host)
-
-    if normalized_host in {"127.0.0.1", "localhost", "[::1]"} or host in WILDCARD_BIND_HOSTS:
-        return allowed_hosts
-
-    allowed_hosts.extend([normalized_host, f"{normalized_host}:{port}", f"{normalized_host}:*"])
-    return allowed_hosts
-
-
-def _default_allowed_origins(host: str, port: int) -> list[str]:
-    allowed_origins = list(LOOPBACK_ALLOWED_ORIGINS)
-    normalized_host = _normalize_host(host)
-
-    if normalized_host in {"127.0.0.1", "localhost", "[::1]"} or host in WILDCARD_BIND_HOSTS:
-        return allowed_origins
-
-    allowed_origins.extend([
-        f"http://{normalized_host}",
-        f"http://{normalized_host}:{port}",
-        f"http://{normalized_host}:*",
-        f"https://{normalized_host}",
-        f"https://{normalized_host}:{port}",
-        f"https://{normalized_host}:*",
-    ])
-    return allowed_origins
-
-
-def _build_transport_security_settings(host: str, port: int) -> TransportSecuritySettings:
-    allowed_hosts = _split_csv(os.environ.get("MCP_ALLOWED_HOSTS"))
-    allowed_origins = _split_csv(os.environ.get("MCP_ALLOWED_ORIGINS"))
-
-    if not _is_dns_rebinding_protection_enabled() or "*" in allowed_hosts or "*" in allowed_origins:
+    FastMCP's streamable_http_app() runs its own TransportSecurityMiddleware internally.
+    We must configure it explicitly — otherwise FastMCP auto-enables loopback-only
+    protection whenever the default host (127.0.0.1) is used at init time.
+    """
+    if not _is_dns_rebinding_protection_enabled():
         return TransportSecuritySettings(enable_dns_rebinding_protection=False)
 
+    explicit_hosts = _split_csv(os.environ.get("MCP_ALLOWED_HOSTS"))
+    explicit_origins = _split_csv(os.environ.get("MCP_ALLOWED_ORIGINS"))
+
+    if "*" in explicit_hosts or "*" in explicit_origins:
+        return TransportSecuritySettings(enable_dns_rebinding_protection=False)
+
+    if explicit_hosts or explicit_origins:
+        return TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=explicit_hosts,
+            allowed_origins=explicit_origins,
+        )
+
+    # No explicit config: mirror the original default behaviour.
+    normalized = _normalize_host(bind_host)
+    if bind_host in WILDCARD_BIND_HOSTS:
+        return TransportSecuritySettings(enable_dns_rebinding_protection=False)
+    if normalized in set(LOOPBACK_HOSTS):
+        return TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=[f"{h}:*" for h in LOOPBACK_HOSTS],
+            allowed_origins=[f"http://{h}:*" for h in LOOPBACK_HOSTS],
+        )
     return TransportSecuritySettings(
         enable_dns_rebinding_protection=True,
-        allowed_hosts=_expand_allowed_hosts(allowed_hosts) if allowed_hosts else _default_allowed_hosts(host, port),
-        allowed_origins=_expand_allowed_origins(allowed_origins)
-        if allowed_origins
-        else _default_allowed_origins(host, port),
+        allowed_hosts=[f"{h}:*" for h in LOOPBACK_HOSTS] + [normalized, f"{normalized}:{port}", f"{normalized}:*"],
+        allowed_origins=[f"http://{h}:*" for h in LOOPBACK_HOSTS]
+        + [f"http://{normalized}", f"http://{normalized}:{port}", f"https://{normalized}", f"https://{normalized}:{port}"],
     )
 
 
-def _configure_http_transport(host: str, port: int) -> None:
-    mcp.settings.host = host
-    mcp.settings.port = port
-    mcp.settings.transport_security = _build_transport_security_settings(host, port)
+def _build_starlette_app(transport: str, bind_host: str, port: int) -> Starlette:
+    """Build the parent Starlette app that mounts FastMCP plus the attachment route."""
+
+    # Configure FastMCP's internal transport security before building the app.
+    mcp.settings.transport_security = _build_fastmcp_transport_security(bind_host, port)
+
+    @contextlib.asynccontextmanager
+    async def lifespan(app: Starlette) -> AsyncIterator[None]:
+        attachment_store.start_cleanup_task()
+        async with mcp.session_manager.run():
+            yield
+        attachment_store.stop_cleanup_task()
+
+    mcp_app = mcp.sse_app() if transport == "sse" else mcp.streamable_http_app()
+
+    middleware = []
+    trusted_host = _build_trusted_host_middleware(bind_host, port)
+    if trusted_host is not None:
+        middleware.append(trusted_host)
+
+    return Starlette(
+        routes=[
+            attachment_route,
+            Mount("/", app=mcp_app),
+        ],
+        middleware=middleware,
+        lifespan=lifespan,
+    )
 
 
 @app.command()
@@ -120,11 +154,11 @@ def stdio():
 
 @app.command()
 def sse(
-    host: str = "localhost",
-    port: int = 9557,
+    host: str = os.environ.get("MCP_HOST", "localhost"),
+    port: int = int(os.environ.get("MCP_PORT", 9557)),
 ):
-    _configure_http_transport(host, port)
-    mcp.run(transport="sse")
+    starlette_app = _build_starlette_app("sse", host, port)
+    uvicorn.run(starlette_app, host=host, port=port)
 
 
 @app.command()
@@ -132,8 +166,8 @@ def streamable_http(
     host: str = os.environ.get("MCP_HOST", "localhost"),
     port: int = int(os.environ.get("MCP_PORT", 9557)),
 ):
-    _configure_http_transport(host, port)
-    mcp.run(transport="streamable-http")
+    starlette_app = _build_starlette_app("streamable-http", host, port)
+    uvicorn.run(starlette_app, host=host, port=port)
 
 
 @app.command()
