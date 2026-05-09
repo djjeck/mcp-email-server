@@ -4,6 +4,7 @@ from typing import Annotated, Literal
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 
+from mcp_email_server.attachments.store import attachment_store
 from mcp_email_server.config import (
     AccountAttributes,
     EmailSettings,
@@ -197,7 +198,12 @@ async def delete_emails(
 
 
 @mcp.tool(
-    description="Download an email attachment and save it to the specified path. This feature must be explicitly enabled in settings (enable_attachment_download=true) due to security considerations.",
+    description=(
+        "Download an email attachment. Returns a temporary URL for the attachment when the server is running in HTTP "
+        "mode and MCP_BASE_URL is configured, allowing remote agents to fetch it without shared filesystem access. "
+        "Optionally saves to a local path when save_path is provided. "
+        "This feature must be explicitly enabled in settings (enable_attachment_download=true) due to security considerations."
+    ),
 )
 async def download_attachment(
     account_name: Annotated[str, Field(description="The name of the email account.")],
@@ -207,8 +213,14 @@ async def download_attachment(
     attachment_name: Annotated[
         str, Field(description="The name of the attachment to download (as shown in the attachments list).")
     ],
-    save_path: Annotated[str, Field(description="The absolute path where the attachment should be saved.")],
     mailbox: Annotated[str, Field(description="The mailbox to search in (default: INBOX).")] = "INBOX",
+    save_path: Annotated[
+        str | None,
+        Field(
+            default=None,
+            description="Optional absolute path to save the attachment to disk. Not required when using the returned URL.",
+        ),
+    ] = None,
 ) -> AttachmentDownloadResponse:
     settings = get_settings()
     if not settings.enable_attachment_download:
@@ -218,4 +230,10 @@ async def download_attachment(
         raise PermissionError(msg)
 
     handler = dispatch_handler(account_name)
-    return await handler.download_attachment(email_id, attachment_name, save_path, mailbox)
+    response = await handler.download_attachment(email_id, attachment_name, save_path, mailbox)
+
+    if settings.base_url and response.data:
+        token = attachment_store.put(response.data, response.attachment_name, response.mime_type)
+        response.url = f"{settings.base_url}/attachments/{token}/{response.attachment_name}"
+
+    return response

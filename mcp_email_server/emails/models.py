@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class EmailMetadata(BaseModel):
@@ -62,4 +62,7 @@ class AttachmentDownloadResponse(BaseModel):
     attachment_name: str
     mime_type: str
     size: int
-    saved_path: str
+    saved_path: str | None = None
+    url: str | None = None
+    # Raw bytes carried internally for URL-serving; excluded from serialized output.
+    data: bytes = Field(default=b"", exclude=True, repr=False)
