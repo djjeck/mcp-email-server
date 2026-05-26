@@ -33,6 +33,24 @@ from mcp_email_server.log import logger
 MAX_BODY_LENGTH = 20000
 
 
+# RFC 3501 system flags (except \Recent which is read-only) + custom keyword atoms
+_VALID_IMAP_FLAG = re.compile(r"^\\[A-Za-z]+$|^[A-Za-z][A-Za-z0-9_-]*$")
+
+
+def _validate_flags(flags: list[str]) -> str:
+    """Validate and format IMAP flags into a parenthesised string.
+
+    Accepts system flags (e.g. ``\\Draft``, ``\\Seen``) and custom keyword
+    atoms.  Raises ``ValueError`` on anything that could inject IMAP protocol
+    characters.
+    """
+    for flag in flags:
+        if not _VALID_IMAP_FLAG.match(flag):
+            msg = f"Invalid IMAP flag: {flag!r}"
+            raise ValueError(msg)
+    return "(" + " ".join(flags) + ")"
+
+
 def _quote_mailbox(mailbox: str) -> str:
     """Quote mailbox name for IMAP compatibility.
 
@@ -785,7 +803,7 @@ class EmailClient:
 
         return msg
 
-    async def send_email(
+    def compose_message(
         self,
         recipients: list[str],
         subject: str,
@@ -796,8 +814,19 @@ class EmailClient:
         attachments: list[str] | None = None,
         in_reply_to: str | None = None,
         references: str | None = None,
-    ):
-        # Create message with or without attachments
+        include_bcc_header: bool = False,
+    ) -> MIMEText | MIMEMultipart:
+        """Compose an email message without sending it.
+
+        Builds MIME structure, sets headers (Subject, From, To, Cc, Date,
+        Message-Id, threading headers). Synchronous — no I/O.
+
+        When ``include_bcc_header`` is True (used for local IMAP storage such
+        as Drafts or Sent copies), the Bcc header is included so mail clients
+        can display the BCC recipients.  When False (default, used for SMTP
+        sending), the Bcc header is omitted — BCC recipients are delivered
+        via the SMTP envelope only.
+        """
         if attachments:
             msg = self._create_message_with_attachments(body, html, attachments)
         else:
@@ -822,20 +851,36 @@ class EmailClient:
         if cc:
             msg["Cc"] = ", ".join(cc)
 
+        # Add BCC header when saving locally (drafts, sent copies)
+        if bcc and include_bcc_header:
+            msg["Bcc"] = ", ".join(bcc)
+
         # Set threading headers for replies
         if in_reply_to:
             msg["In-Reply-To"] = in_reply_to
         if references:
             msg["References"] = references
 
-        # Set Date and Message-Id headers so the same values appear in both
-        # the SMTP-sent copy and the IMAP Sent folder copy
+        # Set Date and Message-Id headers
         msg["Date"] = email.utils.formatdate(localtime=True)
         sender_domain = self.sender.rsplit("@", 1)[-1].rstrip(">")
         msg["Message-Id"] = email.utils.make_msgid(domain=sender_domain)
 
-        # Note: BCC recipients are not added to headers (they remain hidden)
-        # but will be included in the actual recipients for SMTP delivery
+        return msg
+
+    async def send_email(
+        self,
+        recipients: list[str],
+        subject: str,
+        body: str,
+        cc: list[str] | None = None,
+        bcc: list[str] | None = None,
+        html: bool = False,
+        attachments: list[str] | None = None,
+        in_reply_to: str | None = None,
+        references: str | None = None,
+    ) -> MIMEText | MIMEMultipart:
+        msg = self.compose_message(recipients, subject, body, cc, bcc, html, attachments, in_reply_to, references)
 
         async with aiosmtplib.SMTP(
             hostname=self.email_server.host,
@@ -975,6 +1020,70 @@ class EmailClient:
         except Exception as e:
             logger.error(f"Error saving to Sent folder: {e}")
             return False
+        finally:
+            try:
+                await imap.logout()
+            except Exception as e:
+                logger.debug(f"Error during logout: {e}")
+
+    async def append_to_mailbox(
+        self,
+        msg: MIMEText | MIMEMultipart,
+        incoming_server: EmailServer,
+        mailbox: str,
+        flags: str = r"(\Draft \Seen)",
+    ) -> str | None:
+        """Append a message to the specified IMAP folder.
+
+        Unlike append_to_sent, this targets a single user-specified mailbox
+        without folder discovery. Returns the IMAP UID of the appended message
+        (if the server supports APPENDUID / RFC 4315), or ``"unknown"`` on
+        success without UID, or ``None`` on failure.
+        """
+        if incoming_server.use_ssl:
+            imap_ssl_context = _create_ssl_context(incoming_server.verify_ssl)
+            imap = aioimaplib.IMAP4_SSL(incoming_server.host, incoming_server.port, ssl_context=imap_ssl_context)
+        else:
+            imap = aioimaplib.IMAP4(incoming_server.host, incoming_server.port)
+
+        try:
+            await imap._client_task
+            await imap.wait_hello_from_server()
+            await imap.login(incoming_server.user_name, incoming_server.password.get_secret_value())
+            await _send_imap_id(imap)
+
+            result = await imap.select(_quote_mailbox(mailbox))
+            status = result[0] if isinstance(result, tuple) else result
+            if str(status).upper() != "OK":
+                logger.warning(f"Mailbox '{mailbox}' not found or not selectable: {status}")
+                return None
+
+            msg_bytes = msg.as_bytes()
+            append_result = await imap.append(
+                msg_bytes,
+                mailbox=_quote_mailbox(mailbox),
+                flags=flags,
+            )
+            append_status = append_result[0] if isinstance(append_result, tuple) else append_result
+            if str(append_status).upper() == "OK":
+                # Try to extract UID from APPENDUID response (RFC 4315)
+                uid = None
+                if isinstance(append_result, tuple) and len(append_result) > 1:
+                    for part in append_result[1]:
+                        part_str = part.decode("utf-8") if isinstance(part, bytes) else str(part)
+                        match = re.search(r"APPENDUID\s+\d+\s+(\d+)", part_str, re.IGNORECASE)
+                        if match:
+                            uid = match.group(1)
+                            break
+                logger.info(f"Saved email to '{mailbox}'" + (f" (UID {uid})" if uid else ""))
+                return uid or "unknown"
+            else:
+                logger.warning(f"Failed to append to '{mailbox}': {append_status}")
+                return None
+
+        except Exception as e:
+            logger.error(f"Error saving to mailbox '{mailbox}': {e}")
+            return None
         finally:
             try:
                 await imap.logout()
@@ -1235,6 +1344,11 @@ class ClassicEmailHandler(EmailHandler):
 
         # Save to Sent folder if enabled
         if self.save_to_sent and msg:
+            # Add BCC header to the saved copy so users can see who was BCC'd.
+            # This MUST happen after smtp.send_message() — that ordering is
+            # load-bearing for security (BCC must not appear in sent headers).
+            if bcc and msg["Bcc"] is None:
+                msg["Bcc"] = ", ".join(bcc)
             try:
                 await self.outgoing_client.append_to_sent(
                     msg,
@@ -1243,6 +1357,56 @@ class ClassicEmailHandler(EmailHandler):
                 )
             except Exception as e:
                 logger.error(f"Failed to save email to Sent folder: {e}", exc_info=True)
+
+    async def save_to_mailbox(
+        self,
+        recipients: list[str],
+        subject: str,
+        body: str,
+        mailbox: str = "Drafts",
+        cc: list[str] | None = None,
+        bcc: list[str] | None = None,
+        html: bool = False,
+        attachments: list[str] | None = None,
+        in_reply_to: str | None = None,
+        references: str | None = None,
+        flags: list[str] | None = None,
+    ) -> str:
+        """Compose and save an email to the specified IMAP mailbox.
+
+        BCC headers are preserved in the saved message so mail clients can
+        display BCC recipients (unlike ``send_email``, where BCC is handled
+        via the SMTP envelope only).
+
+        Returns:
+            A string in the format ``<message-id>|uid:<uid>``.
+
+        Raises:
+            ValueError: If any flag in *flags* is invalid per RFC 3501.
+            RuntimeError: If the IMAP APPEND operation fails.
+        """
+        msg = self.outgoing_client.compose_message(
+            recipients,
+            subject,
+            body,
+            cc,
+            bcc,
+            html,
+            attachments,
+            in_reply_to,
+            references,
+            include_bcc_header=True,
+        )
+
+        flags_str = r"(\Draft \Seen)" if flags is None else _validate_flags(flags)
+
+        uid = await self.outgoing_client.append_to_mailbox(msg, self.email_settings.incoming, mailbox, flags_str)
+
+        if uid is None:
+            raise RuntimeError(f"Failed to save email to mailbox '{mailbox}'")
+
+        message_id = msg["Message-Id"] or "saved"
+        return f"{message_id}|uid:{uid}"
 
     async def delete_emails(self, email_ids: list[str], mailbox: str = "INBOX") -> tuple[list[str], list[str]]:
         """Delete emails by their UIDs. Returns (deleted_ids, failed_ids)."""
