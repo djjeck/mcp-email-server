@@ -415,6 +415,27 @@ class TestClassicEmailHandler:
             assert msg["References"] == "<original@example.com>"
 
     @pytest.mark.asyncio
+    async def test_send_email_with_reply_to(self, classic_handler):
+        """Test sending email with Reply-To header."""
+        mock_smtp = AsyncMock()
+        mock_smtp.__aenter__.return_value = mock_smtp
+        mock_smtp.__aexit__.return_value = None
+        mock_smtp.login = AsyncMock()
+        mock_smtp.send_message = AsyncMock()
+
+        with patch("aiosmtplib.SMTP", return_value=mock_smtp):
+            await classic_handler.send_email(
+                recipients=["recipient@example.com"],
+                subject="Test",
+                body="Body",
+                reply_to="replyhere@example.com",
+            )
+
+            call_args = mock_smtp.send_message.call_args
+            msg = call_args[0][0]
+            assert msg["Reply-To"] == "replyhere@example.com"
+
+    @pytest.mark.asyncio
     async def test_get_emails_content_includes_message_id(self, classic_handler):
         """Test that get_emails_content returns message_id from parsed email data."""
         now = datetime.now(timezone.utc)

@@ -1041,7 +1041,7 @@ class EmailClient:
         reply_to: str | None = None,
     ) -> MIMEText | MIMEMultipart:
         msg = self.compose_message(
-            recipients, subject, body, cc, bcc, html, attachments, in_reply_to, references, reply_to
+            recipients, subject, body, cc, bcc, html, attachments, in_reply_to, references, False, reply_to
         )
 
         async with aiosmtplib.SMTP(
