@@ -812,6 +812,7 @@ class EmailClient:
         attachments: list[str] | None = None,
         in_reply_to: str | None = None,
         references: str | None = None,
+        reply_to: str | None = None,
     ):
         # Create message with or without attachments
         if attachments:
@@ -843,6 +844,8 @@ class EmailClient:
             msg["In-Reply-To"] = in_reply_to
         if references:
             msg["References"] = references
+        if reply_to:
+            msg["Reply-To"] = reply_to
 
         # Set Date and Message-Id headers so the same values appear in both
         # the SMTP-sent copy and the IMAP Sent folder copy
@@ -1136,9 +1139,10 @@ class ClassicEmailHandler(EmailHandler):
         attachments: list[str] | None = None,
         in_reply_to: str | None = None,
         references: str | None = None,
+        reply_to: str | None = None,
     ) -> None:
         msg = await self.outgoing_client.send_email(
-            recipients, subject, body, cc, bcc, html, attachments, in_reply_to, references
+            recipients, subject, body, cc, bcc, html, attachments, in_reply_to, references, reply_to
         )
 
         # Save to Sent folder if enabled
