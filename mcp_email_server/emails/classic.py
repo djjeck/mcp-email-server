@@ -1040,7 +1040,9 @@ class EmailClient:
         references: str | None = None,
         reply_to: str | None = None,
     ) -> MIMEText | MIMEMultipart:
-        msg = self.compose_message(recipients, subject, body, cc, bcc, html, attachments, in_reply_to, references, reply_to)
+        msg = self.compose_message(
+            recipients, subject, body, cc, bcc, html, attachments, in_reply_to, references, reply_to
+        )
 
         async with aiosmtplib.SMTP(
             hostname=self.email_server.host,
