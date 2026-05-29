@@ -66,6 +66,7 @@ class EmailHandler(abc.ABC):
         attachments: list[str] | None = None,
         in_reply_to: str | None = None,
         references: str | None = None,
+        reply_to: str | None = None,
     ) -> None:
         """
         Send email
@@ -80,6 +81,7 @@ class EmailHandler(abc.ABC):
             attachments: List of file paths to attach.
             in_reply_to: Message-ID of the email being replied to (for threading).
             references: Space-separated Message-IDs for the thread chain.
+            reply_to: Address to set as Reply-To header (overrides From for replies).
         """
 
     @abc.abstractmethod

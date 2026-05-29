@@ -971,6 +971,7 @@ class EmailClient:
         in_reply_to: str | None = None,
         references: str | None = None,
         include_bcc_header: bool = False,
+        reply_to: str | None = None,
     ) -> MIMEText | MIMEMultipart:
         """Compose an email message without sending it.
 
@@ -1016,6 +1017,8 @@ class EmailClient:
             msg["In-Reply-To"] = in_reply_to
         if references:
             msg["References"] = references
+        if reply_to:
+            msg["Reply-To"] = reply_to
 
         # Set Date and Message-Id headers
         msg["Date"] = email.utils.formatdate(localtime=True)
@@ -1035,8 +1038,11 @@ class EmailClient:
         attachments: list[str] | None = None,
         in_reply_to: str | None = None,
         references: str | None = None,
+        reply_to: str | None = None,
     ) -> MIMEText | MIMEMultipart:
-        msg = self.compose_message(recipients, subject, body, cc, bcc, html, attachments, in_reply_to, references)
+        msg = self.compose_message(
+            recipients, subject, body, cc, bcc, html, attachments, in_reply_to, references, False, reply_to
+        )
 
         async with aiosmtplib.SMTP(
             hostname=self.email_server.host,
@@ -1482,12 +1488,13 @@ class ClassicEmailHandler(EmailHandler):
         attachments: list[str] | None = None,
         in_reply_to: str | None = None,
         references: str | None = None,
+        reply_to: str | None = None,
     ) -> None:
         if self.outgoing_client is None:
             raise RuntimeError(f"SMTP is not configured for account '{self.email_settings.account_name}'")
 
         msg = await self.outgoing_client.send_email(
-            recipients, subject, body, cc, bcc, html, attachments, in_reply_to, references
+            recipients, subject, body, cc, bcc, html, attachments, in_reply_to, references, reply_to
         )
 
         # Save to Sent folder if enabled
